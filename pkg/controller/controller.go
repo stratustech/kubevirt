@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"runtime/debug"
 
+	k8sapps "k8s.io/api/apps/v1"
 	k8sv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -228,42 +229,44 @@ func ApplyVolumeRequestOnVMISpec(vmiSpec *v1.VirtualMachineInstanceSpec, request
 	return vmiSpec
 }
 
-func CurrentVMIPod(vmi *v1.VirtualMachineInstance, podInformer cache.SharedIndexInformer) (*k8sv1.Pod, error) {
+func CurrentVMIPod(vmi *v1.VirtualMachineInstance, podInformer cache.SharedIndexInformer) (*k8sapps.StatefulSet, error) {
 
 	// current pod is the most recent pod created on the current VMI node
 	// OR the most recent pod created if no VMI node is set.
 
-	// Get all pods from the namespace
+	// Get all sts from the namespace
 	objs, err := podInformer.GetIndexer().ByIndex(cache.NamespaceIndex, vmi.Namespace)
 	if err != nil {
 		return nil, err
 	}
-	pods := []*k8sv1.Pod{}
+	sts := []*k8sapps.StatefulSet{}
 	for _, obj := range objs {
-		pod := obj.(*k8sv1.Pod)
-		pods = append(pods, pod)
+		st := obj.(*k8sapps.StatefulSet)
+		sts = append(sts, st)
 	}
 
-	var curPod *k8sv1.Pod = nil
-	for _, pod := range pods {
-		if !IsControlledBy(pod, vmi) {
-			continue
-		}
+	var curSts *k8sapps.StatefulSet = nil
+	for _, st := range sts {
+		/*
+			if !IsControlledBy(st, vmi) {
+				continue
+			}
+		*/
 
 		if vmi.Status.NodeName != "" &&
-			vmi.Status.NodeName != pod.Spec.NodeName {
+			vmi.Status.NodeName != st.Spec.Template.Spec.NodeName {
 			// This pod isn't scheduled to the current node.
 			// This can occur during the initial migration phases when
 			// a new target node is being prepared for the VMI.
 			continue
 		}
 
-		if curPod == nil || curPod.CreationTimestamp.Before(&pod.CreationTimestamp) {
-			curPod = pod
+		if curSts == nil || curSts.Spec.Template.CreationTimestamp.Before(&st.Spec.Template.CreationTimestamp) {
+			curSts = st
 		}
 	}
 
-	return curPod, nil
+	return curSts, nil
 }
 
 func VMIActivePodsCount(vmi *v1.VirtualMachineInstance, vmiPodInformer cache.SharedIndexInformer) int {

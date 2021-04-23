@@ -390,7 +390,7 @@ func (c *MigrationController) updateStatus(migration *virtv1.VirtualMachineInsta
 
 func (c *MigrationController) createTargetPod(migration *virtv1.VirtualMachineInstanceMigration, vmi *virtv1.VirtualMachineInstance) error {
 
-	templatePod, err := c.templateService.RenderLaunchManifest(vmi)
+	templatePod, templateSvc, err := c.templateService.RenderLaunchManifest(vmi)
 	if err != nil {
 		return fmt.Errorf("failed to render launch manifest: %v", err)
 	}
@@ -406,32 +406,40 @@ func (c *MigrationController) createTargetPod(migration *virtv1.VirtualMachineIn
 	antiAffinityRule := &k8sv1.PodAntiAffinity{
 		RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{antiAffinityTerm},
 	}
-
-	if templatePod.Spec.Affinity == nil {
-		templatePod.Spec.Affinity = &k8sv1.Affinity{
+	podSpec := templatePod.Spec.Template.Spec
+	if podSpec.Affinity == nil {
+		podSpec.Affinity = &k8sv1.Affinity{
 			PodAntiAffinity: antiAffinityRule,
 		}
-	} else if templatePod.Spec.Affinity.PodAntiAffinity == nil {
-		templatePod.Spec.Affinity.PodAntiAffinity = antiAffinityRule
+	} else if podSpec.Affinity.PodAntiAffinity == nil {
+		podSpec.Affinity.PodAntiAffinity = antiAffinityRule
 	} else {
-		templatePod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(templatePod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution, antiAffinityTerm)
+		podSpec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(podSpec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution, antiAffinityTerm)
 	}
 
 	templatePod.ObjectMeta.Labels[virtv1.MigrationJobLabel] = string(migration.UID)
 	templatePod.ObjectMeta.Annotations[virtv1.MigrationJobNameAnnotation] = string(migration.Name)
 
 	// TODO libvirt requires unique host names for each target and source
-	templatePod.Spec.Hostname = ""
+	podSpec.Hostname = ""
 
 	key := controller.MigrationKey(migration)
 	c.podExpectations.ExpectCreations(key, 1)
-	pod, err := c.clientset.CoreV1().Pods(vmi.GetNamespace()).Create(context.Background(), templatePod, v1.CreateOptions{})
+
+	svc, err := c.clientset.CoreV1().Services(vmi.GetNamespace()).Create(context.Background(), templateSvc, v1.CreateOptions{})
+	if err != nil {
+		c.recorder.Eventf(vmi, k8sv1.EventTypeWarning, FailedCreatePodReason, "Error creating service: %v", err)
+		return fmt.Errorf("failed to create vmi migration target service: %v", err)
+	}
+	c.recorder.Eventf(migration, k8sv1.EventTypeNormal, SuccessfulCreatePodReason, "Created ft service %s", svc.Name)
+
+	sts, err := c.clientset.AppsV1().StatefulSets(vmi.GetNamespace()).Create(context.Background(), templatePod, v1.CreateOptions{})
 	if err != nil {
 		c.recorder.Eventf(vmi, k8sv1.EventTypeWarning, FailedCreatePodReason, "Error creating pod: %v", err)
 		c.podExpectations.CreationObserved(key)
 		return fmt.Errorf("failed to create vmi migration target pod: %v", err)
 	}
-	c.recorder.Eventf(migration, k8sv1.EventTypeNormal, SuccessfulCreatePodReason, "Created migration target pod %s", pod.Name)
+	c.recorder.Eventf(migration, k8sv1.EventTypeNormal, SuccessfulCreatePodReason, "Created migration target pod %s", sts.Name)
 	return nil
 }
 

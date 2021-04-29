@@ -110,7 +110,7 @@ type VirtControllerApp struct {
 	templateService services.TemplateService
 	restClient      *clientrest.RESTClient
 	informerFactory controller.KubeInformerFactory
-	kvPodInformer   cache.SharedIndexInformer
+	kvStsInformer   cache.SharedIndexInformer
 
 	nodeInformer   cache.SharedIndexInformer
 	nodeController *NodeController
@@ -256,7 +256,7 @@ func Execute() {
 	restful.Add(webService)
 
 	app.vmiInformer = app.informerFactory.VMI()
-	app.kvPodInformer = app.informerFactory.KubeVirtPod()
+	app.kvStsInformer = app.informerFactory.KubeVirtSts()
 	app.nodeInformer = app.informerFactory.KubeVirtNode()
 
 	app.vmiCache = app.vmiInformer.GetStore()
@@ -322,7 +322,7 @@ func (vca *VirtControllerApp) configModificationCallback() {
 // Update virt-controller log verbosity on relevant config changes
 func (vca *VirtControllerApp) shouldChangeLogVerbosity() {
 	verbosity := vca.clusterConfig.GetVirtHandlerVerbosity(vca.host)
-	log.Log.SetVerbosityLevel(int(verbosity))
+	log.Log.SetVerbosityLevel(4)
 	log.Log.V(2).Infof("set log verbosity to %d", verbosity)
 }
 
@@ -439,10 +439,10 @@ func (vca *VirtControllerApp) initCommon() {
 		vca.launcherSubGid,
 	)
 
-	vca.vmiController = NewVMIController(vca.templateService, vca.vmiInformer, vca.kvPodInformer, vca.persistentVolumeClaimInformer, vca.vmiRecorder, vca.clientSet, vca.dataVolumeInformer)
+	vca.vmiController = NewVMIController(vca.templateService, vca.vmiInformer, vca.kvStsInformer, vca.persistentVolumeClaimInformer, vca.vmiRecorder, vca.clientSet, vca.dataVolumeInformer)
 	recorder := vca.getNewRecorder(k8sv1.NamespaceAll, "node-controller")
 	vca.nodeController = NewNodeController(vca.clientSet, vca.nodeInformer, vca.vmiInformer, recorder)
-	vca.migrationController = NewMigrationController(vca.templateService, vca.vmiInformer, vca.kvPodInformer, vca.migrationInformer, vca.vmiRecorder, vca.clientSet, vca.clusterConfig)
+	vca.migrationController = NewMigrationController(vca.templateService, vca.vmiInformer, vca.kvStsInformer, vca.migrationInformer, vca.vmiRecorder, vca.clientSet, vca.clusterConfig)
 }
 
 func (vca *VirtControllerApp) initReplicaSet() {

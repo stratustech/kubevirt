@@ -28,10 +28,12 @@ import (
 	"strconv"
 	"strings"
 
+	k8sapps "k8s.io/api/apps/v1"
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/cache"
 
 	hostdisk "kubevirt.io/kubevirt/pkg/host-disk"
@@ -92,9 +94,9 @@ const ENV_VAR_VIRT_LAUNCHER_LOG_VERBOSITY = "VIRT_LAUNCHER_LOG_VERBOSITY"
 const EXT_LOG_VERBOSITY_THRESHOLD = 5
 
 type TemplateService interface {
-	RenderLaunchManifest(*v1.VirtualMachineInstance) (*k8sv1.Pod, error)
-	RenderHotplugAttachmentPodTemplate(volume *v1.Volume, ownerPod *k8sv1.Pod, vmi *v1.VirtualMachineInstance, pvcName string, isBlock bool) (*k8sv1.Pod, error)
-	RenderLaunchManifestNoVm(*v1.VirtualMachineInstance) (*k8sv1.Pod, error)
+	RenderLaunchManifest(*v1.VirtualMachineInstance) (*k8sapps.StatefulSet, *k8sv1.Service, error)
+	RenderHotplugAttachmentPodTemplate(volume *v1.Volume, ownerPod *k8sapps.StatefulSet, vmi *v1.VirtualMachineInstance, pvcName string, isBlock bool, tempPod bool) (*k8sapps.StatefulSet, error)
+	RenderLaunchManifestNoVm(*v1.VirtualMachineInstance) (*k8sapps.StatefulSet, *k8sv1.Service, error)
 }
 
 type templateService struct {
@@ -217,7 +219,9 @@ func CPUFeatureLabelsFromCPUFeatures(vmi *v1.VirtualMachineInstance) []string {
 	return labels
 }
 
-func SetNodeAffinityForForbiddenFeaturePolicy(vmi *v1.VirtualMachineInstance, pod *k8sv1.Pod) {
+func SetNodeAffinityForForbiddenFeaturePolicy(vmi *v1.VirtualMachineInstance, sts *k8sapps.StatefulSet) {
+
+	podSpec := sts.Spec.Template.Spec
 
 	if vmi.Spec.Domain.CPU == nil || vmi.Spec.Domain.CPU.Features == nil {
 		return
@@ -239,25 +243,25 @@ func SetNodeAffinityForForbiddenFeaturePolicy(vmi *v1.VirtualMachineInstance, po
 				},
 			}
 
-			if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
-				if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
-					terms := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+			if podSpec.Affinity != nil && podSpec.Affinity.NodeAffinity != nil {
+				if podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+					terms := podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 					// Since NodeSelectorTerms are ORed , the anti affinity requirement will be added to each term.
 					for i, selectorTerm := range terms {
-						pod.Spec.Affinity.NodeAffinity.
+						podSpec.Affinity.NodeAffinity.
 							RequiredDuringSchedulingIgnoredDuringExecution.
 							NodeSelectorTerms[i].MatchExpressions = append(selectorTerm.MatchExpressions, requirement)
 					}
 				} else {
-					pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &k8sv1.NodeSelector{
+					podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &k8sv1.NodeSelector{
 						NodeSelectorTerms: []k8sv1.NodeSelectorTerm{term},
 					}
 				}
 
-			} else if pod.Spec.Affinity != nil {
-				pod.Spec.Affinity.NodeAffinity = nodeAffinity
+			} else if podSpec.Affinity != nil {
+				podSpec.Affinity.NodeAffinity = nodeAffinity
 			} else {
-				pod.Spec.Affinity = &k8sv1.Affinity{
+				podSpec.Affinity = &k8sv1.Affinity{
 					NodeAffinity: nodeAffinity,
 				}
 
@@ -313,14 +317,14 @@ func requestResource(resources *k8sv1.ResourceRequirements, resourceName string)
 		resources.Requests[name] = unitQuantity
 	}
 }
-func (t *templateService) RenderLaunchManifestNoVm(vmi *v1.VirtualMachineInstance) (*k8sv1.Pod, error) {
+func (t *templateService) RenderLaunchManifestNoVm(vmi *v1.VirtualMachineInstance) (*k8sapps.StatefulSet, *k8sv1.Service, error) {
 	return t.renderLaunchManifest(vmi, true)
 }
-func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (*k8sv1.Pod, error) {
+func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (*k8sapps.StatefulSet, *k8sv1.Service, error) {
 	return t.renderLaunchManifest(vmi, false)
 }
 
-func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, tempPod bool) (*k8sv1.Pod, error) {
+func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, tempPod bool) (*k8sapps.StatefulSet, *k8sv1.Service, error) {
 	precond.MustNotBeNil(vmi)
 	domain := precond.MustNotBeEmpty(vmi.GetObjectMeta().GetName())
 	namespace := precond.MustNotBeEmpty(vmi.GetObjectMeta().GetNamespace())
@@ -392,10 +396,10 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, t
 			_, exists, isBlock, err := types.IsPVCBlockFromStore(t.persistentVolumeClaimStore, namespace, claimName)
 			if err != nil {
 				logger.Errorf("error getting PVC: %v", claimName)
-				return nil, err
+				return nil, nil, err
 			} else if !exists {
 				logger.Errorf("didn't find PVC %v", claimName)
-				return nil, PvcNotFoundError(fmt.Errorf("didn't find PVC %v", claimName))
+				return nil, nil, PvcNotFoundError(fmt.Errorf("didn't find PVC %v", claimName))
 			} else if isBlock {
 				devicePath := filepath.Join(string(filepath.Separator), "dev", volume.Name)
 				device := k8sv1.VolumeDevice{
@@ -457,10 +461,10 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, t
 			_, exists, isBlock, err := types.IsPVCBlockFromStore(t.persistentVolumeClaimStore, namespace, claimName)
 			if err != nil {
 				logger.Errorf("error getting PVC associated with DataVolume: %v", claimName)
-				return nil, err
+				return nil, nil, err
 			} else if !exists {
 				logger.Errorf("didn't find PVC associated with DataVolume: %v", claimName)
-				return nil, PvcNotFoundError(fmt.Errorf("didn't find PVC associated with DataVolume: %v", claimName))
+				return nil, nil, PvcNotFoundError(fmt.Errorf("didn't find PVC associated with DataVolume: %v", claimName))
 			} else if isBlock {
 				devicePath := filepath.Join(string(filepath.Separator), "dev", volume.Name)
 				device := k8sv1.VolumeDevice{
@@ -789,7 +793,7 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, t
 	// Read requested hookSidecars from VMI meta
 	requestedHookSidecarList, err := hooks.UnmarshalHookSidecarList(vmi)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(requestedHookSidecarList) != 0 {
@@ -887,7 +891,7 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, t
 
 	networkToResourceMap, err := getNetworkToResourceMap(t.virtClient, vmi)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Register resource requests and limits corresponding to attached multus networks.
@@ -1087,7 +1091,7 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, t
 
 	cniAnnotations, err := getCniAnnotations(vmi)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for k, v := range cniAnnotations {
 		annotationsList[k] = v
@@ -1149,44 +1153,80 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, t
 		initContainers = append(initContainers, containerdisk.GenerateInitContainers(vmi, "container-disks", "virt-bin-share-dir")...)
 	}
 
-	// TODO use constants for podLabels
-	pod := k8sv1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "virt-launcher-" + domain + "-",
-			Labels:       podLabels,
-			Annotations:  annotationsList,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(vmi, v1.VirtualMachineInstanceGroupVersionKind),
+	svc := k8sv1.Service{
+		Spec: k8sv1.ServiceSpec{
+			Ports: []k8sv1.ServicePort{
+				k8sv1.ServicePort{
+					Name:     "ft-port",
+					Protocol: "TCP",
+					Port:     1800,
+					TargetPort: intstr.IntOrString{
+						IntVal: 1800,
+					},
+				},
 			},
+			Selector:  map[string]string{"app": "stratus-ft", "version": "v1"},
+			Type:      k8sv1.ServiceTypeClusterIP,
+			ClusterIP: "None",
 		},
-		Spec: k8sv1.PodSpec{
-			Hostname:  hostName,
-			Subdomain: vmi.Spec.Subdomain,
-			SecurityContext: &k8sv1.PodSecurityContext{
-				RunAsUser: &userId,
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "ft-service",
+			Labels: map[string]string{"app": "stratus-ft", "version": "v1"},
+		},
+	}
+
+	// TODO use constants for podLabels
+	var replicas int32 = 2
+	sts := k8sapps.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "stratusvm-" + domain + "-",
+		},
+
+		Spec: k8sapps.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "stratus-ft", "version": "v1"},
 			},
-			TerminationGracePeriodSeconds: &gracePeriodKillAfter,
-			RestartPolicy:                 k8sv1.RestartPolicyNever,
-			Containers:                    containers,
-			InitContainers:                initContainers,
-			NodeSelector:                  nodeSelector,
-			Volumes:                       volumes,
-			ImagePullSecrets:              imagePullSecrets,
-			DNSConfig:                     vmi.Spec.DNSConfig,
-			DNSPolicy:                     vmi.Spec.DNSPolicy,
+			Template: k8sv1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "virt-launcher-" + domain + "-",
+					Labels:       podLabels,
+					Annotations:  annotationsList,
+					OwnerReferences: []metav1.OwnerReference{
+						*metav1.NewControllerRef(vmi, v1.VirtualMachineInstanceGroupVersionKind),
+					},
+				},
+				Spec: k8sv1.PodSpec{
+					Hostname:  hostName,
+					Subdomain: vmi.Spec.Subdomain,
+					SecurityContext: &k8sv1.PodSecurityContext{
+						RunAsUser: &userId,
+					},
+					TerminationGracePeriodSeconds: &gracePeriodKillAfter,
+					RestartPolicy:                 k8sv1.RestartPolicyNever,
+					Containers:                    containers,
+					InitContainers:                initContainers,
+					NodeSelector:                  nodeSelector,
+					Volumes:                       volumes,
+					ImagePullSecrets:              imagePullSecrets,
+					DNSConfig:                     vmi.Spec.DNSConfig,
+					DNSPolicy:                     vmi.Spec.DNSPolicy,
+				},
+			},
 		},
 	}
 
 	// If an SELinux type was specified, use that--otherwise don't set an SELinux type
 	selinuxType := t.clusterConfig.GetSELinuxLauncherType()
 	if selinuxType != "" {
-		pod.Spec.SecurityContext.SELinuxOptions = &k8sv1.SELinuxOptions{Type: selinuxType}
+		podSpec := sts.Spec.Template.Spec
+		podSpec.SecurityContext.SELinuxOptions = &k8sv1.SELinuxOptions{Type: selinuxType}
 		// By setting an SELinux option on the virt-launcher pod, we trigger this:
 		// https://github.com/kubernetes/kubernetes/issues/90759
 		// Since the compute container needs to be able to communicate with the rest of the pod,
 		//   we loop over all the containers and remove their SELinux categories.
-		for i := range pod.Spec.Containers {
-			container := &pod.Spec.Containers[i]
+		for i := range podSpec.Containers {
+			container := &podSpec.Containers[i]
 			if container.Name != "compute" {
 				if container.SecurityContext == nil {
 					container.SecurityContext = &k8sv1.SecurityContext{}
@@ -1201,129 +1241,143 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, t
 	}
 
 	if vmi.Spec.PriorityClassName != "" {
-		pod.Spec.PriorityClassName = vmi.Spec.PriorityClassName
+		sts.Spec.Template.Spec.PriorityClassName = vmi.Spec.PriorityClassName
 	}
 
 	if vmi.Spec.Affinity != nil {
-		pod.Spec.Affinity = vmi.Spec.Affinity.DeepCopy()
+		sts.Spec.Template.Spec.Affinity = vmi.Spec.Affinity.DeepCopy()
 	}
 
 	if t.clusterConfig.CPUNodeDiscoveryEnabled() {
-		SetNodeAffinityForForbiddenFeaturePolicy(vmi, &pod)
+		SetNodeAffinityForForbiddenFeaturePolicy(vmi, &sts)
 	}
 
-	pod.Spec.Tolerations = vmi.Spec.Tolerations
+	podSpec := sts.Spec.Template.Spec
+	podSpec.Tolerations = vmi.Spec.Tolerations
 
-	pod.Spec.SchedulerName = vmi.Spec.SchedulerName
+	podSpec.SchedulerName = vmi.Spec.SchedulerName
 
 	enableServiceLinks := false
-	pod.Spec.EnableServiceLinks = &enableServiceLinks
+	podSpec.EnableServiceLinks = &enableServiceLinks
 
 	if len(serviceAccountName) > 0 {
-		pod.Spec.ServiceAccountName = serviceAccountName
+		podSpec.ServiceAccountName = serviceAccountName
 		automount := true
-		pod.Spec.AutomountServiceAccountToken = &automount
+		podSpec.AutomountServiceAccountToken = &automount
 	} else {
 		automount := false
-		pod.Spec.AutomountServiceAccountToken = &automount
+		podSpec.AutomountServiceAccountToken = &automount
 	}
 
-	return &pod, nil
+	return &sts, &svc, nil
 }
 
-func (t *templateService) RenderHotplugAttachmentPodTemplate(volume *v1.Volume, ownerPod *k8sv1.Pod, vmi *v1.VirtualMachineInstance, pvcName string, isBlock bool) (*k8sv1.Pod, error) {
+func (t *templateService) RenderHotplugAttachmentPodTemplate(volume *v1.Volume, ownerPod *k8sapps.StatefulSet, _ *v1.VirtualMachineInstance, pvcName string, isBlock bool, tempPod bool) (*k8sapps.StatefulSet, error) {
 	zero := int64(0)
-	pod := &k8sv1.Pod{
+	var replicas int32 = 2
+	sts := &k8sapps.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "hp-volume-",
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(ownerPod, schema.GroupVersionKind{
-					Group:   k8sv1.SchemeGroupVersion.Group,
-					Version: k8sv1.SchemeGroupVersion.Version,
-					Kind:    "Pod",
-				}),
-			},
-			Labels: map[string]string{
-				v1.AppLabel: "hotplug-disk",
-			},
+			GenerateName: "stratusvm-",
 		},
-		Spec: k8sv1.PodSpec{
-			Containers: []k8sv1.Container{
-				{
-					Name:    "hotplug-disk",
-					Image:   t.launcherImage,
-					Command: []string{"/bin/sh", "-c", "tail -f /dev/null"},
-					Resources: k8sv1.ResourceRequirements{ //Took the request and limits from containerDisk init container.
-						Limits: map[k8sv1.ResourceName]resource.Quantity{
-							k8sv1.ResourceCPU:    resource.MustParse("100m"),
-							k8sv1.ResourceMemory: resource.MustParse("40M"),
-						},
-						Requests: map[k8sv1.ResourceName]resource.Quantity{
-							k8sv1.ResourceCPU:    resource.MustParse("10m"),
-							k8sv1.ResourceMemory: resource.MustParse("1M"),
-						},
+		Spec: k8sapps.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "t1", "s2iBuilder": "t1-s2i-1x55", "version": "v1"},
+			},
+			Template: k8sv1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "hp-volume-",
+					OwnerReferences: []metav1.OwnerReference{
+						*metav1.NewControllerRef(ownerPod, schema.GroupVersionKind{
+							Group:   k8sv1.SchemeGroupVersion.Group,
+							Version: k8sv1.SchemeGroupVersion.Version,
+							Kind:    "Pod",
+						}),
 					},
-					SecurityContext: &k8sv1.SecurityContext{
-						SELinuxOptions: &k8sv1.SELinuxOptions{
-							Level: "s0",
-							Type:  t.clusterConfig.GetSELinuxLauncherType(),
-						},
+					Labels: map[string]string{
+						v1.AppLabel: "hotplug-disk",
 					},
 				},
-			},
-			Affinity: &k8sv1.Affinity{
-				PodAffinity: &k8sv1.PodAffinity{
-					RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{
+				Spec: k8sv1.PodSpec{
+					Containers: []k8sv1.Container{
 						{
-							LabelSelector: &metav1.LabelSelector{
-								MatchLabels: ownerPod.GetLabels(),
+							Name:    "hotplug-disk",
+							Image:   t.launcherImage,
+							Command: []string{"/bin/sh", "-c", "tail -f /dev/null"},
+							Resources: k8sv1.ResourceRequirements{ //Took the request and limits from containerDisk init container.
+								Limits: map[k8sv1.ResourceName]resource.Quantity{
+									k8sv1.ResourceCPU:    resource.MustParse("100m"),
+									k8sv1.ResourceMemory: resource.MustParse("40M"),
+								},
+								Requests: map[k8sv1.ResourceName]resource.Quantity{
+									k8sv1.ResourceCPU:    resource.MustParse("10m"),
+									k8sv1.ResourceMemory: resource.MustParse("1M"),
+								},
 							},
-							TopologyKey: "kubernetes.io/hostname",
+							SecurityContext: &k8sv1.SecurityContext{
+								SELinuxOptions: &k8sv1.SELinuxOptions{
+									Level: "s0",
+									Type:  t.clusterConfig.GetSELinuxLauncherType(),
+								},
+							},
 						},
 					},
-				},
-			},
-			Volumes: []k8sv1.Volume{
-				{
-					Name: volume.Name,
-					VolumeSource: k8sv1.VolumeSource{
-						PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
-							ClaimName: pvcName,
-							ReadOnly:  false,
+					Affinity: &k8sv1.Affinity{
+						PodAffinity: &k8sv1.PodAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: ownerPod.GetLabels(),
+									},
+									TopologyKey: "kubernetes.io/hostname",
+								},
+							},
 						},
 					},
-				},
-				{
-					Name: "hotplug-disks",
-					VolumeSource: k8sv1.VolumeSource{
-						EmptyDir: &k8sv1.EmptyDirVolumeSource{},
+					Volumes: []k8sv1.Volume{
+						{
+							Name: volume.Name,
+							VolumeSource: k8sv1.VolumeSource{
+								PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+									ReadOnly:  false,
+								},
+							},
+						},
+						{
+							Name: "hotplug-disks",
+							VolumeSource: k8sv1.VolumeSource{
+								EmptyDir: &k8sv1.EmptyDirVolumeSource{},
+							},
+						},
 					},
+					HostNetwork:                   true,
+					TerminationGracePeriodSeconds: &zero,
 				},
 			},
-			HostNetwork:                   true,
-			TerminationGracePeriodSeconds: &zero,
 		},
 	}
 
+	podSpec := sts.Spec.Template.Spec
 	if isBlock {
-		pod.Spec.Containers[0].VolumeDevices = []k8sv1.VolumeDevice{
+		podSpec.Containers[0].VolumeDevices = []k8sv1.VolumeDevice{
 			{
 				Name:       volume.Name,
 				DevicePath: "/dev/hotplugblockdevice",
 			},
 		}
-		pod.Spec.SecurityContext = &k8sv1.PodSecurityContext{
+		podSpec.SecurityContext = &k8sv1.PodSecurityContext{
 			RunAsUser: &[]int64{0}[0],
 		}
 	} else {
-		pod.Spec.Containers[0].VolumeMounts = []k8sv1.VolumeMount{
+		podSpec.Containers[0].VolumeMounts = []k8sv1.VolumeMount{
 			{
 				Name:      volume.Name,
 				MountPath: "/pvc",
 			},
 		}
 	}
-	return pod, nil
+	return sts, nil
 }
 
 func getRequiredCapabilities(vmi *v1.VirtualMachineInstance) []k8sv1.Capability {

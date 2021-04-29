@@ -31,6 +31,7 @@ import (
 	secv1 "github.com/openshift/api/security/v1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
+	k8sapps "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8sv1 "k8s.io/api/core/v1"
@@ -80,7 +81,7 @@ type KubeInformerFactory interface {
 	VirtualMachinePreset() cache.SharedIndexInformer
 
 	// Watches for pods related only to kubevirt
-	KubeVirtPod() cache.SharedIndexInformer
+	KubeVirtSts() cache.SharedIndexInformer
 
 	// Watches for nodes
 	KubeVirtNode() cache.SharedIndexInformer
@@ -334,6 +335,19 @@ func (f *kubeInformerFactory) KubeVirtPod() cache.SharedIndexInformer {
 
 		lw := NewListWatchFromClient(f.clientSet.CoreV1().RESTClient(), "pods", k8sv1.NamespaceAll, fields.Everything(), labelSelector)
 		return cache.NewSharedIndexInformer(lw, &k8sv1.Pod{}, f.defaultResync, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	})
+}
+
+func (f *kubeInformerFactory) KubeVirtSts() cache.SharedIndexInformer {
+	return f.getInformer("kubeVirtStsInformer", func() cache.SharedIndexInformer {
+		// Watch all pods with the kubevirt app label
+		labelSelector, err := labels.Parse(kubev1.AppLabel)
+		if err != nil {
+			panic(err)
+		}
+
+		lw := NewListWatchFromClient(f.clientSet.AppsV1().RESTClient(), "statefulsets", k8sv1.NamespaceAll, fields.Everything(), labelSelector)
+		return cache.NewSharedIndexInformer(lw, &k8sapps.StatefulSet{}, f.defaultResync, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	})
 }
 

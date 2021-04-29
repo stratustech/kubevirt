@@ -18,6 +18,7 @@ limitations under the License.
 package controller
 
 import (
+	k8sapps "k8s.io/api/apps/v1"
 	k8sv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -32,6 +33,7 @@ func GetControllerOf(pod *k8sv1.Pod) *metav1.OwnerReference {
 	if controllerRef != nil {
 		return controllerRef
 	}
+
 	// We may find pods that are only using CreatedByLabel and not set with an OwnerReference
 	if createdBy := pod.Labels[virtv1.CreatedByLabel]; len(createdBy) > 0 {
 		name := pod.Annotations[virtv1.DomainAnnotation]
@@ -40,6 +42,30 @@ func GetControllerOf(pod *k8sv1.Pod) *metav1.OwnerReference {
 		return metav1.NewControllerRef(vmi, virtv1.VirtualMachineInstanceGroupVersionKind)
 	}
 	return nil
+}
+
+// GetControllerOf returns the controllerRef if controllee has a controller,
+// otherwise returns nil.
+func GetControllerOfSts(sts *k8sapps.StatefulSet) *metav1.OwnerReference {
+	controllerRef := metav1.GetControllerOf(sts)
+	if controllerRef != nil {
+		return controllerRef
+	}
+	// We may find pods that are only using CreatedByLabel and not set with an OwnerReference
+	if createdBy := sts.Labels[virtv1.CreatedByLabel]; len(createdBy) > 0 {
+		name := sts.Annotations[virtv1.DomainAnnotation]
+		uid := types.UID(createdBy)
+		vmi := virtv1.NewVMI(name, uid)
+		return metav1.NewControllerRef(vmi, virtv1.VirtualMachineInstanceGroupVersionKind)
+	}
+	return nil
+}
+
+func IsControlledBySts(sts *k8sapps.StatefulSet, vmi *virtv1.VirtualMachineInstance) bool {
+	if controllerRef := GetControllerOfSts(sts); controllerRef != nil {
+		return controllerRef.UID == vmi.UID
+	}
+	return false
 }
 
 func IsControlledBy(pod *k8sv1.Pod, vmi *virtv1.VirtualMachineInstance) bool {

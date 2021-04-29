@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	k8sapps "k8s.io/api/apps/v1"
 	k8sv1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -95,9 +96,9 @@ func NewMigrationController(templateService services.TemplateService,
 	})
 
 	c.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.addPod,
-		DeleteFunc: c.deletePod,
-		UpdateFunc: c.updatePod,
+		AddFunc:    c.addSts,
+		DeleteFunc: c.deleteSts,
+		UpdateFunc: c.updateSts,
 	})
 
 	c.migrationInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -380,7 +381,7 @@ func (c *MigrationController) updateStatus(migration *virtv1.VirtualMachineInsta
 
 func (c *MigrationController) createTargetPod(migration *virtv1.VirtualMachineInstanceMigration, vmi *virtv1.VirtualMachineInstance) error {
 
-	templatePod, err := c.templateService.RenderLaunchManifest(vmi)
+	templatePod, templateSvc, err := c.templateService.RenderLaunchManifest(vmi)
 	if err != nil {
 		return fmt.Errorf("failed to render launch manifest: %v", err)
 	}
@@ -396,32 +397,40 @@ func (c *MigrationController) createTargetPod(migration *virtv1.VirtualMachineIn
 	antiAffinityRule := &k8sv1.PodAntiAffinity{
 		RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{antiAffinityTerm},
 	}
-
-	if templatePod.Spec.Affinity == nil {
-		templatePod.Spec.Affinity = &k8sv1.Affinity{
+	podSpec := templatePod.Spec.Template.Spec
+	if podSpec.Affinity == nil {
+		podSpec.Affinity = &k8sv1.Affinity{
 			PodAntiAffinity: antiAffinityRule,
 		}
-	} else if templatePod.Spec.Affinity.PodAntiAffinity == nil {
-		templatePod.Spec.Affinity.PodAntiAffinity = antiAffinityRule
+	} else if podSpec.Affinity.PodAntiAffinity == nil {
+		podSpec.Affinity.PodAntiAffinity = antiAffinityRule
 	} else {
-		templatePod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(templatePod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution, antiAffinityTerm)
+		podSpec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(podSpec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution, antiAffinityTerm)
 	}
 
 	templatePod.ObjectMeta.Labels[virtv1.MigrationJobLabel] = string(migration.UID)
 	templatePod.ObjectMeta.Annotations[virtv1.MigrationJobNameAnnotation] = string(migration.Name)
 
 	// TODO libvirt requires unique host names for each target and source
-	templatePod.Spec.Hostname = ""
+	podSpec.Hostname = ""
 
 	key := controller.MigrationKey(migration)
 	c.podExpectations.ExpectCreations(key, 1)
-	pod, err := c.clientset.CoreV1().Pods(vmi.GetNamespace()).Create(context.Background(), templatePod, v1.CreateOptions{})
+
+	svc, err := c.clientset.CoreV1().Services(vmi.GetNamespace()).Create(context.Background(), templateSvc, v1.CreateOptions{})
+	if err != nil {
+		c.recorder.Eventf(vmi, k8sv1.EventTypeWarning, FailedCreatePodReason, "Error creating service: %v", err)
+		return fmt.Errorf("failed to create vmi migration target service: %v", err)
+	}
+	c.recorder.Eventf(migration, k8sv1.EventTypeNormal, SuccessfulCreatePodReason, "Created ft service %s", svc.Name)
+
+	sts, err := c.clientset.AppsV1().StatefulSets(vmi.GetNamespace()).Create(context.Background(), templatePod, v1.CreateOptions{})
 	if err != nil {
 		c.recorder.Eventf(vmi, k8sv1.EventTypeWarning, FailedCreatePodReason, "Error creating pod: %v", err)
 		c.podExpectations.CreationObserved(key)
 		return fmt.Errorf("failed to create vmi migration target pod: %v", err)
 	}
-	c.recorder.Eventf(migration, k8sv1.EventTypeNormal, SuccessfulCreatePodReason, "Created migration target pod %s", pod.Name)
+	c.recorder.Eventf(migration, k8sv1.EventTypeNormal, SuccessfulCreatePodReason, "Created migration target pod %s", sts.Name)
 	return nil
 }
 
@@ -607,12 +616,12 @@ func (c *MigrationController) enqueueMigration(obj interface{}) {
 	c.Queue.Add(key)
 }
 
-func (c *MigrationController) getControllerOf(pod *k8sv1.Pod) *v1.OwnerReference {
+func (c *MigrationController) getControllerOf(sts *k8sapps.StatefulSet) *v1.OwnerReference {
 	t := true
 	return &v1.OwnerReference{
 		Kind:               virtv1.VirtualMachineInstanceMigrationGroupVersionKind.Kind,
-		Name:               pod.Annotations[virtv1.MigrationJobNameAnnotation],
-		UID:                types.UID(pod.Labels[virtv1.MigrationJobLabel]),
+		Name:               sts.Annotations[virtv1.MigrationJobNameAnnotation],
+		UID:                types.UID(sts.Labels[virtv1.MigrationJobLabel]),
 		Controller:         &t,
 		BlockOwnerDeletion: &t,
 	}
@@ -644,18 +653,18 @@ func (c *MigrationController) resolveControllerRef(namespace string, controllerR
 }
 
 // When a pod is created, enqueue the migration that manages it and update its podExpectations.
-func (c *MigrationController) addPod(obj interface{}) {
-	pod := obj.(*k8sv1.Pod)
+func (c *MigrationController) addSts(obj interface{}) {
+	sts := obj.(*k8sapps.StatefulSet)
 
-	if pod.DeletionTimestamp != nil {
+	if sts.DeletionTimestamp != nil {
 		// on a restart of the controller manager, it's possible a new pod shows up in a state that
 		// is already pending deletion. Prevent the pod from being a creation observation.
-		c.deletePod(pod)
+		c.deleteSts(sts)
 		return
 	}
 
-	controllerRef := c.getControllerOf(pod)
-	migration := c.resolveControllerRef(pod.Namespace, controllerRef)
+	controllerRef := c.getControllerOf(sts)
+	migration := c.resolveControllerRef(sts.Namespace, controllerRef)
 	if migration == nil {
 		return
 	}
@@ -663,7 +672,7 @@ func (c *MigrationController) addPod(obj interface{}) {
 	if err != nil {
 		return
 	}
-	log.Log.V(4).Object(pod).Infof("Pod created")
+	log.Log.V(4).Object(sts).Infof("StatefulSet created")
 	c.podExpectations.CreationObserved(migrationKey)
 	c.enqueueMigration(migration)
 }
@@ -671,49 +680,49 @@ func (c *MigrationController) addPod(obj interface{}) {
 // When a pod is updated, figure out what migration manages it and wake them
 // up. If the labels of the pod have changed we need to awaken both the old
 // and new migration. old and cur must be *v1.Pod types.
-func (c *MigrationController) updatePod(old, cur interface{}) {
-	curPod := cur.(*k8sv1.Pod)
-	oldPod := old.(*k8sv1.Pod)
-	if curPod.ResourceVersion == oldPod.ResourceVersion {
+func (c *MigrationController) updateSts(old, cur interface{}) {
+	curSts := cur.(*k8sapps.StatefulSet)
+	oldSts := old.(*k8sapps.StatefulSet)
+	if curSts.ResourceVersion == oldSts.ResourceVersion {
 		// Periodic resync will send update events for all known pods.
 		// Two different versions of the same pod will always have different RVs.
 		return
 	}
 
-	labelChanged := !reflect.DeepEqual(curPod.Labels, oldPod.Labels)
-	if curPod.DeletionTimestamp != nil {
+	labelChanged := !reflect.DeepEqual(curSts.Labels, oldSts.Labels)
+	if curSts.DeletionTimestamp != nil {
 		// having a pod marked for deletion is enough to count as a deletion expectation
-		c.deletePod(curPod)
+		c.deleteSts(curSts)
 		if labelChanged {
 			// we don't need to check the oldPod.DeletionTimestamp because DeletionTimestamp cannot be unset.
-			c.deletePod(oldPod)
+			c.deleteSts(oldSts)
 		}
 		return
 	}
 
-	curControllerRef := c.getControllerOf(curPod)
-	oldControllerRef := c.getControllerOf(oldPod)
+	curControllerRef := c.getControllerOf(curSts)
+	oldControllerRef := c.getControllerOf(oldSts)
 	controllerRefChanged := !reflect.DeepEqual(curControllerRef, oldControllerRef)
 	if controllerRefChanged && oldControllerRef != nil {
 		// The ControllerRef was changed. Sync the old controller, if any.
-		if migration := c.resolveControllerRef(oldPod.Namespace, oldControllerRef); migration != nil {
+		if migration := c.resolveControllerRef(oldSts.Namespace, oldControllerRef); migration != nil {
 			c.enqueueMigration(migration)
 		}
 	}
 
-	migration := c.resolveControllerRef(curPod.Namespace, curControllerRef)
+	migration := c.resolveControllerRef(curSts.Namespace, curControllerRef)
 	if migration == nil {
 		return
 	}
-	log.Log.V(4).Object(curPod).Infof("Pod updated")
+	log.Log.V(4).Object(curSts).Infof("StatefulSet updated")
 	c.enqueueMigration(migration)
 	return
 }
 
 // When a pod is deleted, enqueue the migration that manages the pod and update its podExpectations.
 // obj could be an *v1.Pod, or a DeletionFinalStateUnknown marker item.
-func (c *MigrationController) deletePod(obj interface{}) {
-	pod, ok := obj.(*k8sv1.Pod)
+func (c *MigrationController) deleteSts(obj interface{}) {
+	sts, ok := obj.(*k8sapps.StatefulSet)
 
 	// When a delete is dropped, the relist will notice a pod in the store not
 	// in the list, leading to the insertion of a tombstone object which contains
@@ -725,15 +734,15 @@ func (c *MigrationController) deletePod(obj interface{}) {
 			log.Log.Reason(fmt.Errorf("couldn't get object from tombstone %+v", obj)).Error(failedToProcessDeleteNotificationErrMsg)
 			return
 		}
-		pod, ok = tombstone.Obj.(*k8sv1.Pod)
+		sts, ok = tombstone.Obj.(*k8sapps.StatefulSet)
 		if !ok {
 			log.Log.Reason(fmt.Errorf("tombstone contained object that is not a pod %#v", obj)).Error(failedToProcessDeleteNotificationErrMsg)
 			return
 		}
 	}
 
-	controllerRef := c.getControllerOf(pod)
-	migration := c.resolveControllerRef(pod.Namespace, controllerRef)
+	controllerRef := c.getControllerOf(sts)
+	migration := c.resolveControllerRef(sts.Namespace, controllerRef)
 	if migration == nil {
 		return
 	}
@@ -741,7 +750,7 @@ func (c *MigrationController) deletePod(obj interface{}) {
 	if err != nil {
 		return
 	}
-	c.podExpectations.DeletionObserved(migrationKey, controller.PodKey(pod))
+	c.podExpectations.DeletionObserved(migrationKey, controller.StsKey(sts))
 	c.enqueueMigration(migration)
 }
 

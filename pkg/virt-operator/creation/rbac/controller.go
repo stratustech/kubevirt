@@ -122,6 +122,17 @@ func newControllerClusterRole() *rbacv1.ClusterRole {
 			},
 			{
 				APIGroups: []string{
+					"apps",
+				},
+				Resources: []string{
+					"statefulsets",
+				},
+				Verbs: []string{
+					"get", "list", "watch", "create", "update", "delete", "patch",
+				},
+			},
+			{
+				APIGroups: []string{
 					"",
 				},
 				Resources: []string{

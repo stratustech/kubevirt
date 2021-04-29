@@ -24,7 +24,7 @@ import (
 	"fmt"
 	"runtime/debug"
 
-	k8sv1 "k8s.io/api/core/v1"
+	k8sapps "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -121,8 +121,8 @@ func VirtualMachineKey(vmi *v1.VirtualMachineInstance) string {
 	return fmt.Sprintf("%v/%v", vmi.ObjectMeta.Namespace, vmi.ObjectMeta.Name)
 }
 
-func PodKey(pod *k8sv1.Pod) string {
-	return fmt.Sprintf("%v/%v", pod.Namespace, pod.Name)
+func StsKey(sts *k8sapps.StatefulSet) string {
+	return fmt.Sprintf("%v/%v", sts.Namespace, sts.Name)
 }
 
 func DataVolumeKey(dataVolume *cdiv1.DataVolume) string {
@@ -137,10 +137,10 @@ func VirtualMachineKeys(vmis []*v1.VirtualMachineInstance) []string {
 	return keys
 }
 
-func PodKeys(pods []*k8sv1.Pod) []string {
+func StsKeys(sts []*k8sapps.StatefulSet) []string {
 	keys := []string{}
-	for _, pod := range pods {
-		keys = append(keys, PodKey(pod))
+	for _, st := range sts {
+		keys = append(keys, StsKey(st))
 	}
 	return keys
 }
